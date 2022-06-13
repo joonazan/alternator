@@ -84,6 +84,19 @@ fn convert_status<'b, F: Future, I>(
     }
 }
 
+pub fn join<'a, 'b, A, Af: Future, B, Bf: Future, I>(
+    token: GhostToken<'b>,
+    input: &'a InputSource<'b, I>,
+    a: A,
+    b: B,
+) -> resumable::Join<'a, 'b, A, Af, B, Bf>
+where
+    A: FnOnce(GhostToken<'b>) -> Af,
+    B: FnOnce(GhostToken<'b>) -> Bf,
+{
+    resumable::Join::new(token, &input.pill, a, b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +163,84 @@ mod tests {
 
             assert_eq!(res.into_inner(), 16);
         })
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Move {
+        Fireball,
+        Kick,
+    }
+    use Move::*;
+
+    #[derive(Debug, PartialEq)]
+    enum Action {
+        ChooseMove(Move),
+        ChooseEnergy(u16),
+    }
+    use Action::*;
+
+    async fn turn<'a, 'b>(
+        is: InputSource<'b, (usize, Action)>,
+        token: GhostToken<'b>,
+        board: &'a GhostCell<'b, [(Option<Move>, Option<u16>); 2]>,
+    ) -> GhostToken<'b> {
+        join(
+            token,
+            &is,
+            |t| player_turn(0, t, &is, board),
+            |t| player_turn(1, t, &is, board),
+        )
+        .await
+    }
+
+    async fn player_turn<'a, 'b>(
+        player: usize,
+        mut token: GhostToken<'b>,
+        is: &InputSource<'b, (usize, Action)>,
+        board: &'a GhostCell<'b, [(Option<Move>, Option<u16>); 2]>,
+    ) -> GhostToken<'b> {
+        loop {
+            let (t, action) = is.request_input(token, |(p, _)| *p == player).await;
+            token = t;
+            let plan = &mut board.borrow_mut(&mut token)[player];
+            match action.1 {
+                ChooseMove(m) => plan.0 = Some(m),
+                ChooseEnergy(e) => plan.1 = Some(e),
+            };
+            if plan.0.is_some() && plan.1.is_some() {
+                break;
+            }
+        }
+        token
+    }
+
+    #[test]
+    fn concurrent_turns() {
+        GhostToken::new(|token| {
+            let res = GhostCell::new([(None, None), (None, None)]);
+
+            let mut state = run(turn, token, &res);
+            for input in [
+                (1, ChooseMove(Fireball)),
+                (0, ChooseEnergy(34)),
+                (0, ChooseMove(Kick)),
+                (1, ChooseEnergy(4)),
+            ] {
+                state = match state {
+                    AwaitingInput(t, f) => f.resume_with(t, input),
+                    _ => panic!("should be awaiting input"),
+                };
+            }
+
+            match state {
+                Done(t) => {
+                    assert_eq!(
+                        res.borrow(&t),
+                        &[(Some(Kick), Some(34)), (Some(Fireball), Some(4))]
+                    );
+                }
+                _ => panic!("should have stopped"),
+            }
+        });
     }
 }

@@ -8,3 +8,4 @@ edition = "2021"
 [dependencies]
 futures = "0.3"
 ghost-cell = "0.2"
+pin-project = "1.0"
