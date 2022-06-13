@@ -87,7 +87,7 @@ impl Future for PendOnce {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_cell::{GhostCell, GhostToken};
+    use ghost_cell::GhostToken;
 
     async fn three_yields<'b>(s: SleepingPill<'b>, t: GhostToken<'b>, _: ()) {
         let t = s.sleep(t).await;
