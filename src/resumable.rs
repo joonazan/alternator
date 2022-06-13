@@ -1,5 +1,4 @@
 use crate::poller::Poller;
-use ghost_cell::GhostToken;
 use pin_project::pin_project;
 use std::cell::Cell;
 use std::future::Future;
@@ -7,9 +6,9 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-pub fn run<'b, F, Fut: Future, T>(f: F, token: GhostToken<'b>, arg: T) -> FutureStatus<'b, Fut>
+pub fn run<Token, F, Fut: Future, T>(f: F, token: Token, arg: T) -> FutureStatus<Token, Fut>
 where
-    F: FnOnce(SleepingPill<'b>, GhostToken<'b>, T) -> Fut,
+    F: FnOnce(SleepingPill<Token>, Token, T) -> Fut,
 {
     let token_transport = Rc::new(Cell::new(None));
     let future = f(SleepingPill(token_transport.clone()), token, arg);
@@ -23,24 +22,24 @@ where
 }
 
 #[must_use]
-pub struct SleepingFuture<'b, F: Future> {
-    token_transport: Rc<Cell<Option<GhostToken<'b>>>>,
+pub struct SleepingFuture<Token, F: Future> {
+    token_transport: Rc<Cell<Option<Token>>>,
     poller: Poller<Pin<Box<F>>>,
 }
 
-pub enum FutureStatus<'b, F: Future> {
+pub enum FutureStatus<Token, F: Future> {
     Done(F::Output),
-    Sleeping(GhostToken<'b>, SleepingFuture<'b, F>),
+    Sleeping(Token, SleepingFuture<Token, F>),
 }
 use FutureStatus::*;
 
-impl<'b, F: Future> SleepingFuture<'b, F> {
-    pub fn resume(self, token: GhostToken<'b>) -> FutureStatus<'b, F> {
+impl<Token, F: Future> SleepingFuture<Token, F> {
+    pub fn resume(self, token: Token) -> FutureStatus<Token, F> {
         self.token_transport.set(Some(token));
         self.start()
     }
 
-    fn start(mut self) -> FutureStatus<'b, F> {
+    fn start(mut self) -> FutureStatus<Token, F> {
         if let Some(res) = self.poller.poll_once() {
             Done(res)
         } else {
@@ -54,14 +53,19 @@ impl<'b, F: Future> SleepingFuture<'b, F> {
     }
 }
 
-#[derive(Clone)]
-pub struct SleepingPill<'b>(Rc<Cell<Option<GhostToken<'b>>>>);
+pub struct SleepingPill<Token>(Rc<Cell<Option<Token>>>);
 
-impl<'b> SleepingPill<'b> {
-    pub async fn sleep(&self, token: GhostToken<'b>) -> GhostToken<'b> {
+impl<Token> SleepingPill<Token> {
+    pub async fn sleep(&self, token: Token) -> Token {
         self.0.set(Some(token));
         PendOnce::new().await;
         self.0.take().expect("SleepingPill::sleep(...) was passed to an incompatible executor. You should just await it instead.")
+    }
+}
+
+impl<Token> Clone for SleepingPill<Token> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
 
@@ -87,32 +91,32 @@ impl Future for PendOnce {
 }
 
 #[pin_project]
-pub struct Join<'a, 'b, A, Af: Future, B, Bf: Future>
+pub struct Join<'a, Token, A, Af: Future, B, Bf: Future>
 where
-    A: FnOnce(GhostToken<'b>) -> Af,
-    B: FnOnce(GhostToken<'b>) -> Bf,
+    A: FnOnce(Token) -> Af,
+    B: FnOnce(Token) -> Bf,
 {
-    token_store: &'a Cell<Option<GhostToken<'b>>>,
-    futures: JoinFutures<'b, A, Af, B, Bf>,
+    token_store: &'a Cell<Option<Token>>,
+    futures: JoinFutures<Token, A, Af, B, Bf>,
 }
 
 #[pin_project]
-enum JoinFutures<'b, A, Af: Future, B, Bf: Future>
+enum JoinFutures<Token, A, Af: Future, B, Bf: Future>
 where
-    A: FnOnce(GhostToken<'b>) -> Af,
-    B: FnOnce(GhostToken<'b>) -> Bf,
+    A: FnOnce(Token) -> Af,
+    B: FnOnce(Token) -> Bf,
 {
-    Unpolled(GhostToken<'b>, A, B),
+    Unpolled(Token, A, B),
     Polled(Option<Pin<Box<Af>>>, Option<Pin<Box<Bf>>>),
 }
 use JoinFutures::*;
 
-impl<'a, 'b, A, Af: Future, B, Bf: Future> Join<'a, 'b, A, Af, B, Bf>
+impl<'a, Token, A, Af: Future, B, Bf: Future> Join<'a, Token, A, Af, B, Bf>
 where
-    A: FnOnce(GhostToken<'b>) -> Af,
-    B: FnOnce(GhostToken<'b>) -> Bf,
+    A: FnOnce(Token) -> Af,
+    B: FnOnce(Token) -> Bf,
 {
-    pub fn new(token: GhostToken<'b>, pill: &'a SleepingPill<'b>, a: A, b: B) -> Self {
+    pub fn new(token: Token, pill: &'a SleepingPill<Token>, a: A, b: B) -> Self {
         Self {
             token_store: &pill.0,
             futures: Unpolled(token, a, b),
@@ -120,13 +124,13 @@ where
     }
 }
 
-impl<'a, 'b, A, Af: Future<Output = GhostToken<'b>>, B, Bf: Future<Output = GhostToken<'b>>> Future
-    for Join<'a, 'b, A, Af, B, Bf>
+impl<'a, Token, A, Af: Future<Output = Token>, B, Bf: Future<Output = Token>> Future
+    for Join<'a, Token, A, Af, B, Bf>
 where
-    A: FnOnce(GhostToken<'b>) -> Af,
-    B: FnOnce(GhostToken<'b>) -> Bf,
+    A: FnOnce(Token) -> Af,
+    B: FnOnce(Token) -> Bf,
 {
-    type Output = GhostToken<'b>;
+    type Output = Token;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let proj = self.project();
@@ -134,7 +138,7 @@ where
             Unpolled(_, _, _) => {
                 let (t, a, b) = match std::mem::replace(proj.futures, Polled(None, None)) {
                     Unpolled(t, a, b) => (t, a, b),
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 };
                 let mut af = Box::pin(a(t));
                 let (t, af) = match af.as_mut().poll(cx) {
@@ -184,7 +188,11 @@ mod tests {
     use super::*;
     use ghost_cell::GhostToken;
 
-    async fn three_yields<'b>(s: SleepingPill<'b>, t: GhostToken<'b>, _: ()) -> GhostToken<'b> {
+    async fn three_yields<'b>(
+        s: SleepingPill<GhostToken<'b>>,
+        t: GhostToken<'b>,
+        _: (),
+    ) -> GhostToken<'b> {
         let t = s.sleep(t).await;
         let t = s.sleep(t).await;
         s.sleep(t).await
@@ -203,7 +211,7 @@ mod tests {
         });
     }
 
-    async fn concurrent<'b>(s: SleepingPill<'b>, t: GhostToken<'b>, _: ()) {
+    async fn concurrent<'b>(s: SleepingPill<GhostToken<'b>>, t: GhostToken<'b>, _: ()) {
         let ty = |t| three_yields(s.clone(), t, ());
         Join::new(t, &s, ty, ty).await;
     }

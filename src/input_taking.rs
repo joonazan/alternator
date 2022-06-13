@@ -30,7 +30,7 @@ where
 }
 
 pub struct InputSource<'b, I> {
-    pill: SleepingPill<'b>,
+    pill: SleepingPill<GhostToken<'b>>,
     input: Rc<GhostCell<'b, Option<I>>>,
 }
 
@@ -61,7 +61,7 @@ pub enum FutureStatus<'b, F: Future, I> {
 use FutureStatus::*;
 
 pub struct InputStarvedFuture<'b, F: Future, I> {
-    future: resumable::SleepingFuture<'b, F>,
+    future: resumable::SleepingFuture<GhostToken<'b>, F>,
     input: Rc<GhostCell<'b, Option<I>>>,
 }
 
@@ -73,7 +73,7 @@ impl<'b, F: Future, I> InputStarvedFuture<'b, F, I> {
 }
 
 fn convert_status<'b, F: Future, I>(
-    res: resumable::FutureStatus<'b, F>,
+    res: resumable::FutureStatus<GhostToken<'b>, F>,
     input: Rc<GhostCell<'b, Option<I>>>,
 ) -> FutureStatus<'b, F, I> {
     match res {
@@ -89,7 +89,7 @@ pub fn join<'a, 'b, A, Af: Future, B, Bf: Future, I>(
     input: &'a InputSource<'b, I>,
     a: A,
     b: B,
-) -> resumable::Join<'a, 'b, A, Af, B, Bf>
+) -> resumable::Join<'a, GhostToken<'b>, A, Af, B, Bf>
 where
     A: FnOnce(GhostToken<'b>) -> Af,
     B: FnOnce(GhostToken<'b>) -> Bf,
