@@ -8,6 +8,6 @@ description = "Tools for building effect system -like functionality by abusing a
 keywords = ["async", "runtime"]
 
 [dependencies]
-futures = "0.3"
-ghost-cell = "0.2"
 pin-project = "1.0"
+futures = { version = "0.3", default-features = false, features = [] }
+ghost-cell = { version = "0.2", optional = true }

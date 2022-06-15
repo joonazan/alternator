@@ -186,13 +186,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ghost_cell::GhostToken;
 
-    async fn three_yields<'b>(
-        s: SleepingPill<GhostToken<'b>>,
-        t: GhostToken<'b>,
-        _: (),
-    ) -> GhostToken<'b> {
+    struct Token;
+
+    async fn three_yields<'b>(s: SleepingPill<Token>, t: Token, _: ()) -> Token {
         let t = s.sleep(t).await;
         let t = s.sleep(t).await;
         s.sleep(t).await
@@ -200,32 +197,30 @@ mod tests {
 
     #[test]
     fn yields_three_times() {
-        GhostToken::new(|token| {
-            let mut count = 0;
-            let mut r = run(three_yields, token, ());
-            while let Sleeping(token, program) = r {
-                r = program.resume(token);
-                count += 1;
-            }
-            assert_eq!(count, 3);
-        });
+        let token = Token;
+        let mut count = 0;
+        let mut r = run(three_yields, token, ());
+        while let Sleeping(token, program) = r {
+            r = program.resume(token);
+            count += 1;
+        }
+        assert_eq!(count, 3);
     }
 
-    async fn concurrent<'b>(s: SleepingPill<GhostToken<'b>>, t: GhostToken<'b>, _: ()) {
+    async fn concurrent<'b>(s: SleepingPill<Token>, t: Token, _: ()) {
         let ty = |t| three_yields(s.clone(), t, ());
         Join::new(t, &s, ty, ty).await;
     }
 
     #[test]
     fn join_test() {
-        GhostToken::new(|token| {
-            let mut count = 0;
-            let mut r = run(concurrent, token, ());
-            while let Sleeping(token, program) = r {
-                r = program.resume(token);
-                count += 1;
-            }
-            assert_eq!(count, 3);
-        });
+        let token = Token;
+        let mut count = 0;
+        let mut r = run(concurrent, token, ());
+        while let Sleeping(token, program) = r {
+            r = program.resume(token);
+            count += 1;
+        }
+        assert_eq!(count, 3);
     }
 }
