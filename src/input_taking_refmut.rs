@@ -2,27 +2,32 @@ use crate::resumable::{self, SleepingPill};
 use futures::future::FutureExt;
 use std::future::Future;
 
-pub fn run<W, F, Fut: Future, I>(f: F, world: W) -> FutureStatus<W, Fut, I>
+pub fn run<W, F, Fut: Future, I, InputHint>(f: F, world: W) -> FutureStatus<W, Fut, I, InputHint>
 where
-    F: FnOnce(InputSource<W, I>, W) -> Fut,
+    F: FnOnce(InputSource<W, I, InputHint>, W) -> Fut,
 {
     let out = resumable::run(
-        |pill, (world, _), _| f(InputSource { pill }, world),
-        (world, None),
+        |pill, (world, _, _), _| f(InputSource { pill }, world),
+        (world, None, None),
         (),
     );
     convert_status(out)
 }
 
-pub struct InputSource<W, I> {
-    pill: SleepingPill<(W, Option<I>)>,
+pub struct InputSource<W, I, InputHint = ()> {
+    pill: SleepingPill<(W, Option<I>, Option<InputHint>)>,
 }
 
-impl<W, I> InputSource<W, I> {
-    pub async fn request_input<P: Fn(&I) -> bool>(&self, mut world: W, accept: P) -> (W, I) {
+impl<W, I, InputHint: Clone> InputSource<W, I, InputHint> {
+    pub async fn request_input<P: Fn(&I) -> bool>(
+        &self,
+        mut world: W,
+        hint: InputHint,
+        accept: P,
+    ) -> (W, I) {
         let mut input = None;
         loop {
-            (world, input) = self.pill.sleep((world, input)).await;
+            (world, input, _) = self.pill.sleep((world, input, Some(hint.clone()))).await;
             if let Some(i) = input {
                 if accept(&i) {
                     return (world, i);
@@ -33,36 +38,51 @@ impl<W, I> InputSource<W, I> {
     }
 }
 
-pub enum FutureStatus<W, F: Future, I> {
-    Done(F::Output),
-    AwaitingInput(W, InputStarvedFuture<W, F, I>),
-}
-use FutureStatus::*;
-
-pub struct InputStarvedFuture<W, F: Future, I> {
-    future: resumable::SleepingFuture<(W, Option<I>), F>,
-}
-
-impl<W, F: Future, I> InputStarvedFuture<W, F, I> {
-    pub fn resume_with(self, world: W, input: I) -> FutureStatus<W, F, I> {
-        convert_status(self.future.resume((world, Some(input))))
+impl<W, I> InputSource<W, I> {
+    pub async fn get_input<P: Fn(&I) -> bool>(&self, world: W, accept: P) -> (W, I) {
+        self.request_input(world, (), accept).await
     }
 }
 
-fn convert_status<W, F: Future, I>(
-    res: resumable::FutureStatus<(W, Option<I>), F>,
-) -> FutureStatus<W, F, I> {
+pub enum FutureStatus<W, F: Future, I, InputHint> {
+    Done(F::Output),
+    AwaitingInput(W, InputStarvedFuture<W, F, I, InputHint>, InputHint),
+}
+use FutureStatus::*;
+
+pub struct InputStarvedFuture<W, F: Future, I, InputHint> {
+    future: resumable::SleepingFuture<(W, Option<I>, Option<InputHint>), F>,
+}
+
+impl<W, F: Future, I, InputHint> InputStarvedFuture<W, F, I, InputHint> {
+    pub fn resume_with(self, world: W, input: I) -> FutureStatus<W, F, I, InputHint> {
+        convert_status(self.future.resume((world, Some(input), None)))
+    }
+}
+
+fn convert_status<W, F: Future, I, InputHint>(
+    res: resumable::FutureStatus<(W, Option<I>, Option<InputHint>), F>,
+) -> FutureStatus<W, F, I, InputHint> {
     match res {
         resumable::FutureStatus::Done(x) => Done(x),
-        resumable::FutureStatus::Sleeping((world, _), future) => {
-            AwaitingInput(world, InputStarvedFuture { future })
+        resumable::FutureStatus::Sleeping((world, _, input_hint), future) => {
+            AwaitingInput(world, InputStarvedFuture { future }, input_hint.unwrap())
         }
     }
 }
 
-pub fn join<'is, W, A, Af: Future<Output = W> + 'is, B, Bf: Future<Output = W> + 'is, I>(
+pub fn join<
+    'is,
+    W,
+    A,
+    Af: Future<Output = W> + 'is,
+    B,
+    Bf: Future<Output = W> + 'is,
+    I,
+    InputHint,
+>(
     world: W,
-    input: &'is InputSource<W, I>,
+    input: &'is InputSource<W, I, InputHint>,
     a: A,
     b: B,
 ) -> impl Future<Output = W> + 'is
@@ -74,12 +94,12 @@ where
     // because the only way to finish a future is making progress
     // and that requires consuming an input.
     resumable::Join::new(
-        (world, None),
+        (world, None, None),
         &input.pill,
-        |(w, _)| a(w).map(|w| (w, None)),
-        |(w, _)| b(w).map(|w| (w, None)),
+        |(w, _, _)| a(w).map(|w| (w, None, None)),
+        |(w, _, _)| b(w).map(|w| (w, None, None)),
     )
-    .map(|(w, _)| w)
+    .map(|(w, _, _)| w)
 }
 
 #[cfg(test)]
@@ -95,7 +115,7 @@ mod tests {
 
     async fn calculator<'a>(is: InputSource<&'a mut i32, Command>, mut result: &'a mut i32) {
         loop {
-            let (w, cmd) = is.request_input(result, |_| true).await;
+            let (w, cmd) = is.get_input(result, |_| true).await;
             result = w;
             match cmd {
                 Add(x) => *result += x,
@@ -111,7 +131,7 @@ mod tests {
 
         let mut state = run(calculator, &mut res);
         state = match state {
-            AwaitingInput(t, f) => {
+            AwaitingInput(t, f, ()) => {
                 assert_eq!(*t, 5);
                 f.resume_with(t, Mul(3))
             }
@@ -119,7 +139,7 @@ mod tests {
         };
 
         state = match state {
-            AwaitingInput(t, f) => {
+            AwaitingInput(t, f, ()) => {
                 assert_eq!(*t, 15);
                 f.resume_with(t, Add(1))
             }
@@ -127,7 +147,7 @@ mod tests {
         };
 
         state = match state {
-            AwaitingInput(t, f) => {
+            AwaitingInput(t, f, ()) => {
                 assert_eq!(*t, 16);
                 f.resume_with(t, Stop)
             }
@@ -178,7 +198,7 @@ mod tests {
         mut board: &'a mut Board,
     ) -> &'a mut Board {
         loop {
-            let (b, action) = is.request_input(board, |(p, _)| *p == player).await;
+            let (b, action) = is.get_input(board, |(p, _)| *p == player).await;
             board = b;
             let plan = &mut board[player];
             match action.1 {
@@ -204,7 +224,7 @@ mod tests {
             (1, ChooseEnergy(4)),
         ] {
             state = match state {
-                AwaitingInput(b, f) => f.resume_with(b, input),
+                AwaitingInput(b, f, ()) => f.resume_with(b, input),
                 _ => panic!("should be awaiting input"),
             };
         }
