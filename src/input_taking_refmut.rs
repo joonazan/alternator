@@ -18,19 +18,17 @@ pub struct InputSource<W, I, InputHint = ()> {
     pill: SleepingPill<(W, Option<I>, Option<InputHint>)>,
 }
 
-impl<W, I, InputHint: Clone> InputSource<W, I, InputHint> {
-    pub async fn request_input<P: Fn(&I) -> bool>(
-        &self,
-        mut world: W,
-        hint: InputHint,
-        accept: P,
-    ) -> (W, I) {
+impl<W, I: Clone, InputHint: Clone> InputSource<W, I, InputHint> {
+    pub async fn request_input<II, F>(&self, mut world: W, hint: InputHint, filter: F) -> (W, II)
+    where
+        F: Fn(I, &W) -> Option<II>,
+    {
         let mut input = None;
         loop {
             (world, input, _) = self.pill.sleep((world, input, Some(hint.clone()))).await;
             if let Some(i) = input {
-                if accept(&i) {
-                    return (world, i);
+                if let Some(part) = filter(i.clone(), &world) {
+                    return (world, part);
                 }
                 input = Some(i);
             }
@@ -38,15 +36,20 @@ impl<W, I, InputHint: Clone> InputSource<W, I, InputHint> {
     }
 }
 
-impl<W, I> InputSource<W, I> {
-    pub async fn get_input<P: Fn(&I) -> bool>(&self, world: W, accept: P) -> (W, I) {
-        self.request_input(world, (), accept).await
+impl<W, I: Clone> InputSource<W, I> {
+    pub async fn get_input<II, F: Fn(I, &W) -> Option<II>>(&self, world: W, filter: F) -> (W, II) {
+        self.request_input(world, (), filter).await
     }
 }
 
 pub enum FutureStatus<W, F: Future, I, InputHint> {
     Done(F::Output),
-    AwaitingInput(W, InputStarvedFuture<W, F, I, InputHint>, InputHint),
+    AwaitingInput {
+        world: W,
+        accepted: bool,
+        future: InputStarvedFuture<W, F, I, InputHint>,
+        input_hint: InputHint,
+    },
 }
 use FutureStatus::*;
 
@@ -65,9 +68,12 @@ fn convert_status<W, F: Future, I, InputHint>(
 ) -> FutureStatus<W, F, I, InputHint> {
     match res {
         resumable::FutureStatus::Done(x) => Done(x),
-        resumable::FutureStatus::Sleeping((world, _, input_hint), future) => {
-            AwaitingInput(world, InputStarvedFuture { future }, input_hint.unwrap())
-        }
+        resumable::FutureStatus::Sleeping((world, input, input_hint), future) => AwaitingInput {
+            world,
+            accepted: input.is_none(),
+            future: InputStarvedFuture { future },
+            input_hint: input_hint.unwrap(),
+        },
     }
 }
 
@@ -106,6 +112,7 @@ where
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
     enum Command {
         Add(i32),
         Mul(i32),
@@ -115,7 +122,7 @@ mod tests {
 
     async fn calculator<'a>(is: InputSource<&'a mut i32, Command>, mut result: &'a mut i32) {
         loop {
-            let (w, cmd) = is.get_input(result, |_| true).await;
+            let (w, cmd) = is.get_input(result, |i, _| Some(i)).await;
             result = w;
             match cmd {
                 Add(x) => *result += x,
@@ -131,25 +138,31 @@ mod tests {
 
         let mut state = run(calculator, &mut res);
         state = match state {
-            AwaitingInput(t, f, ()) => {
+            AwaitingInput {
+                world: t, future, ..
+            } => {
                 assert_eq!(*t, 5);
-                f.resume_with(t, Mul(3))
+                future.resume_with(t, Mul(3))
             }
             _ => panic!("should be awaiting input"),
         };
 
         state = match state {
-            AwaitingInput(t, f, ()) => {
+            AwaitingInput {
+                world: t, future, ..
+            } => {
                 assert_eq!(*t, 15);
-                f.resume_with(t, Add(1))
+                future.resume_with(t, Add(1))
             }
             _ => panic!("should be awaiting input"),
         };
 
         state = match state {
-            AwaitingInput(t, f, ()) => {
+            AwaitingInput {
+                world: t, future, ..
+            } => {
                 assert_eq!(*t, 16);
-                f.resume_with(t, Stop)
+                future.resume_with(t, Stop)
             }
             _ => panic!("should be awaiting input"),
         };
@@ -163,14 +176,14 @@ mod tests {
         assert_eq!(res, 16);
     }
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum Move {
         Fireball,
         Kick,
     }
     use Move::*;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     enum Action {
         ChooseMove(Move),
         ChooseEnergy(u16),
@@ -198,10 +211,12 @@ mod tests {
         mut board: &'a mut Board,
     ) -> &'a mut Board {
         loop {
-            let (b, action) = is.get_input(board, |(p, _)| *p == player).await;
+            let (b, action) = is
+                .get_input(board, |(p, a), _| if p == player { Some(a) } else { None })
+                .await;
             board = b;
             let plan = &mut board[player];
-            match action.1 {
+            match action {
                 ChooseMove(m) => plan.0 = Some(m),
                 ChooseEnergy(e) => plan.1 = Some(e),
             };
@@ -224,7 +239,9 @@ mod tests {
             (1, ChooseEnergy(4)),
         ] {
             state = match state {
-                AwaitingInput(b, f, ()) => f.resume_with(b, input),
+                AwaitingInput {
+                    world: b, future, ..
+                } => future.resume_with(b, input),
                 _ => panic!("should be awaiting input"),
             };
         }
@@ -234,6 +251,24 @@ mod tests {
                 assert_eq!(*b, [(Some(Kick), Some(34)), (Some(Fireball), Some(4))]);
             }
             _ => panic!("should have stopped"),
+        }
+    }
+
+    #[test]
+    fn test_rejection() {
+        let mut board = [(None, None), (None, None)];
+        let mut state = run(turn, &mut board);
+        state = match state {
+            AwaitingInput {
+                world: b, future, ..
+            } => future.resume_with(b, (7, ChooseEnergy(4))),
+            _ => panic!("should be awaiting input"),
+        };
+        match state {
+            AwaitingInput {
+                accepted: false, ..
+            } => {}
+            _ => panic!("should have rejected the input"),
         }
     }
 }
